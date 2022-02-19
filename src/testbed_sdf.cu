@@ -30,6 +30,8 @@
 #include <tiny-cuda-nn/network_with_input_encoding.h>
 #include <tiny-cuda-nn/trainer.h>
 
+#include "open3d/Open3D.h"
+
 using namespace Eigen;
 using namespace tcnn;
 
@@ -935,6 +937,11 @@ void Testbed::render_sdf(
 }
 
 void Testbed::load_mesh() {
+    auto sphere = open3d::geometry::TriangleMesh::CreateSphere(1.0);
+    sphere->ComputeVertexNormals();
+    sphere->PaintUniformColor({0.0, 1.0, 0.0});
+    open3d::visualization::DrawGeometries({sphere});
+
 	if (!equals_case_insensitive(m_data_path.extension(), "obj")) {
 		throw std::runtime_error{"Sdf data path must be a mesh in .obj format."};
 	}

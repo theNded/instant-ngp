@@ -272,10 +272,11 @@ if (OptiX_FOUND OR OptiX_INCLUDE)
 	list(APPEND SOURCES ${OPTIX_PTX_HEADER})
 endif()
 
+find_package(Open3D REQUIRED)
 add_library(ngp STATIC ${SOURCES})
 set_target_properties(ngp PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_target_properties(ngp PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(ngp PUBLIC ${GL_LIBRARIES} tiny-cuda-nn)
+target_link_libraries(ngp PUBLIC ${GL_LIBRARIES} tiny-cuda-nn Open3D::Open3D)
 target_compile_options(ngp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
 
 add_executable(testbed src/main.cu)
