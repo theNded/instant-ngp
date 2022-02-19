@@ -937,36 +937,76 @@ void Testbed::render_sdf(
 	}
 }
 
-void test_load_lidar() {
-	using namespace open3d;
-
+BoundingBox Testbed::get_lidar_scene_aabb(const Vector3f &center, float scale) {
+	// Compute AABB
 	auto device = core::Device("CUDA:0");
+	auto intrinsic = t::geometry::LiDARIntrinsic(m_sdf.lidar_intrinsic_fname, device);
 
-	std::string calib_npz = "data/sdf/ouster_calib.npz";
-	t::geometry::LiDARIntrinsic calib(calib_npz, device);
+	BoundingBox aabb;
+	aabb.min = Vector3f::Constant(std::numeric_limits<float>::infinity());
+	aabb.max = Vector3f::Constant(-std::numeric_limits<float>::infinity());
 
-	t::geometry::LiDARImage src =
-		t::io::CreateImageFromFile("data/sdf/000000.png")->To(device);
+	auto tcenter = core::Tensor(std::vector<float>{center(0), center(1), center(2)}, {1, 3}, core::Dtype::Float32, device);
+	auto offset = core::Tensor::Full({1, 3}, 0.5f, core::Dtype::Float32, device);
 
-	core::Tensor xyz_im, mask_im;
-	core::Tensor transformation =
-			core::Tensor::Eye(4, core::Dtype::Float64, core::Device());
+	int n_poses = m_sdf.lidar_poses.size();
+	for (int i = 0; i < n_poses; ++i) {
+		t::geometry::LiDARImage depth =
+			t::io::CreateImageFromFile(m_sdf.depth_fnames[i])->To(device);
+		auto pose = core::eigen_converter::EigenMatrixToTensor(m_sdf.lidar_poses[i]);
 
-	auto vis = src.Visualize(calib);
-	auto vis_ptr = std::make_shared<open3d::geometry::Image>(
-			vis.ColorizeDepth(1000.0, 0.0, 30.0).ToLegacy());
-	visualization::DrawGeometries({vis_ptr});
+		core::Tensor xyz_im, mask_im;
+		std::tie(xyz_im, mask_im) =
+			depth.Unproject(intrinsic, pose, 0.65, 30.0);
+		auto xyz = xyz_im.IndexGet({mask_im});
+		auto pcd = t::geometry::PointCloud((xyz - tcenter) / scale + offset).ToLegacy();
 
-	std::tie(xyz_im, mask_im) =
-			src.Unproject(calib, transformation, 0.0, 100.0);
+		BoundingBox bbox;
+		bbox.min = pcd.GetMinBound().cast<float>();
+		bbox.max = pcd.GetMaxBound().cast<float>();
 
-	auto pcd_ptr = std::make_shared<open3d::geometry::PointCloud>(
-			t::geometry::PointCloud(xyz_im.IndexGet({mask_im})).ToLegacy());
-	visualization::DrawGeometries({pcd_ptr});
+		aabb.enlarge(bbox);
+	}
+
+	return aabb;
 }
 
 void Testbed::load_posed_lidar_images() {
-	test_load_lidar();
+
+	// TODO: make it configurable somewhere
+	m_sdf.lidar_intrinsic_fname = "data/sdf/ouster_calib.npz";
+
+	auto pose_graph = io::CreatePoseGraphFromFile((m_data_path / "pose_graph.json").str());
+	auto depth_path = (m_data_path / "depth").str();
+
+	utility::filesystem::ListFilesInDirectory(depth_path, m_sdf.depth_fnames);
+	std::sort(m_sdf.depth_fnames.begin(), m_sdf.depth_fnames.end());
+
+	int n_poses = pose_graph->nodes_.size();
+
+	m_sdf.lidar_poses.resize(n_poses);
+	for (int i = 0; i < n_poses; ++i) {
+		m_sdf.lidar_poses[i] = pose_graph->nodes_[i].pose_;
+	}
+
+	utility::LogInfo("Estimating raw aabb from {} frames ...", n_poses);
+	m_raw_aabb = get_lidar_scene_aabb();
+	utility::LogInfo("raw AABB= {}", m_raw_aabb);
+
+
+	// Inflate AABB by 1% to give the network a little wiggle room.
+	m_raw_aabb.inflate(m_raw_aabb.diag().norm() * 0.005f);
+	m_sdf.mesh_scale = m_raw_aabb.diag().maxCoeff();
+
+	auto aabb_center = 0.5 * (m_raw_aabb.min + m_raw_aabb.max);
+	utility::LogInfo("Estimating normalized aabb from {} frames ...", n_poses);
+	m_aabb = get_lidar_scene_aabb(aabb_center, m_sdf.mesh_scale);
+	utility::LogInfo("normalized AABB={}", m_aabb);
+
+	m_aabb = m_aabb.intersection(BoundingBox{Vector3f::Zero(), Vector3f::Ones()});
+	utility::LogInfo("AABB intersects with (0, 1)={}", m_aabb);
+
+	m_render_aabb = m_aabb;
 }
 
 void Testbed::load_mesh() {

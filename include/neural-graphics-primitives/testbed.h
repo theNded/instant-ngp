@@ -250,6 +250,8 @@ public:
 	void load_nerf();
 	void load_mesh();
 	void load_posed_lidar_images();
+	BoundingBox get_lidar_scene_aabb(const Eigen::Vector3f &center = Eigen::Vector3f::Constant(0), float scale = 1.0);
+
 	void set_exposure(float exposure) { m_exposure = exposure; }
 	void set_max_level(float maxlevel);
 	void set_min_level(float minlevel);
@@ -573,6 +575,12 @@ public:
 		float iou_decay = 0.0f;
 		bool calculate_iou_online = false;
 		tcnn::GPUMemory<uint32_t> iou_counter;
+
+		// Additional LiDAR info
+		std::string lidar_intrinsic_fname;
+		std::vector<std::string> depth_fnames;
+		std::vector<Eigen::Matrix4d> lidar_poses;
+
 		struct Training {
 			size_t idx = 0;
 			size_t size = 0;
