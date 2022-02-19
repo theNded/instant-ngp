@@ -101,7 +101,7 @@ void Testbed::load_training_data(const std::string& data_path) {
 	switch (m_testbed_mode) {
 		case ETestbedMode::Nerf:  load_nerf(); break;
 		case ETestbedMode::Sdf:   load_mesh(); break;
-		// case ETestbedMode::LidarSdf: load_posed_lidar_images(); break;
+		case ETestbedMode::LidarSdf: load_posed_lidar_images(); break;
 		case ETestbedMode::Image: load_image(); break;
 		case ETestbedMode::Volume:load_volume(); break;
 		default: throw std::runtime_error{"Invalid testbed mode."};
@@ -511,7 +511,7 @@ void Testbed::imgui() {
 			accum_reset = true;
 		}
 		accum_reset |= ImGui::SliderFloat("Zoom", &m_zoom, 1.f, 10.f);
-		if (m_testbed_mode == ETestbedMode::Sdf) {
+		if (m_testbed_mode == ETestbedMode::Sdf || m_testbed_mode == ETestbedMode::LidarSdf) {
 			accum_reset |= ImGui::Checkbox("Floor", &m_floor_enable);
 			ImGui::SameLine();
 		}
@@ -554,7 +554,7 @@ void Testbed::imgui() {
 				, m_autofocus ? "True" : "False"
 			);
 
-			if (m_testbed_mode == ETestbedMode::Sdf) {
+			if (m_testbed_mode == ETestbedMode::Sdf || m_testbed_mode == ETestbedMode::LidarSdf) {
 				size_t n = strlen(buf);
 				snprintf(buf+n, sizeof(buf)-n,
 					"testbed.sdf.shadow_sharpness = %0.3f\n"
@@ -621,7 +621,7 @@ void Testbed::imgui() {
 		ImGui::InputText("File", snapshot_filename_buf, sizeof(snapshot_filename_buf));
 	}
 
-	if (m_testbed_mode == ETestbedMode::Nerf || m_testbed_mode == ETestbedMode::Sdf) {
+	if (m_testbed_mode == ETestbedMode::Nerf || m_testbed_mode == ETestbedMode::Sdf || m_testbed_mode == ETestbedMode::LidarSdf) {
 		if (ImGui::CollapsingHeader("Marching Cubes Mesh Output")) {
 			BoundingBox aabb = (m_testbed_mode==ETestbedMode::Nerf) ? m_render_aabb : m_aabb;
 			auto res3d = get_marching_cubes_res(m_mesh.res, aabb);
@@ -669,7 +669,7 @@ void Testbed::imgui() {
 			if (obj_filename_buf[0] == '\0') {
 				snprintf(obj_filename_buf, sizeof(obj_filename_buf), "%s", get_filename_in_data_path_with_suffix(m_data_path, m_network_config_path, ".obj").c_str());
 			}
-			float thresh_range = (m_testbed_mode == ETestbedMode::Sdf) ? 0.5f : 10.f;
+			float thresh_range = (m_testbed_mode == ETestbedMode::Sdf || m_testbed_mode == ETestbedMode::LidarSdf) ? 0.5f : 10.f;
 			ImGui::SliderFloat("MC density threshold",&m_mesh.thresh, -thresh_range, thresh_range);
 			ImGui::Combo("Mesh render mode", (int*)&m_mesh_render_mode, "Off\0Vertex Colors\0Vertex Normals\0Face IDs\0");
 			ImGui::Checkbox("Unwrap mesh", &m_mesh.unwrap);
@@ -688,7 +688,7 @@ void Testbed::imgui() {
 		}
 	}
 
-	if (m_testbed_mode == ETestbedMode::Sdf && ImGui::CollapsingHeader("SDF settings")) {
+	if ((m_testbed_mode == ETestbedMode::Sdf || m_testbed_mode == ETestbedMode::LidarSdf) && ImGui::CollapsingHeader("SDF settings")) {
 		accum_reset |= ImGui::Checkbox("Analytic normals", &m_sdf.analytic_normals);
 		ImGui::SameLine();
 		accum_reset |= ImGui::Checkbox("Use octree for acceleration", &m_sdf.use_triangle_octree);
@@ -716,7 +716,7 @@ void Testbed::imgui() {
 		accum_reset |= ImGui::SliderFloat("Distance Scale", &m_volume.inv_distance_scale, 1.f, 100.f, "%.3g", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
 	}
 
-	if (m_testbed_mode == ETestbedMode::Sdf) {
+	if (m_testbed_mode == ETestbedMode::Sdf || m_testbed_mode == ETestbedMode::LidarSdf) {
 		if (ImGui::CollapsingHeader("BRDF parameters")) {
 			accum_reset |= ImGui::ColorEdit3("Base color", (float*)&m_sdf.brdf.basecolor );
 			accum_reset |= ImGui::SliderFloat("Roughness", &m_sdf.brdf.roughness, 0.f, 1.f);
@@ -1301,6 +1301,7 @@ void Testbed::init_window(int resw, int resh, bool hidden) {
 	switch (m_testbed_mode) {
 		case ETestbedMode::Image: title += "Image"; break;
 		case ETestbedMode::Sdf: title += "SDF"; break;
+	    case ETestbedMode::LidarSdf: title += "LiDARSDF"; break;
 		case ETestbedMode::Nerf: title += "NeRF"; break;
 		case ETestbedMode::Volume: title += "Volume"; break;
 	}
@@ -1381,6 +1382,7 @@ bool Testbed::frame() {
 #endif
 
 	draw_contents();
+	// LiDARSDF does not have iou for mesh
 	if (m_testbed_mode == ETestbedMode::Sdf && m_sdf.calculate_iou_online) {
 		m_sdf.iou = calculate_iou(m_train ? 64*64*64 : 128*128*128, m_sdf.iou_decay, false, true);
 		m_sdf.iou_decay = 0.f;
@@ -1566,6 +1568,7 @@ void Testbed::reset_network() {
 	switch (m_testbed_mode) {
 		case ETestbedMode::Nerf:  n_input_dims = 3; n_output_dims = 4; n_pos_dims = 3; break;
 		case ETestbedMode::Sdf:   n_input_dims = 3; n_output_dims = 1; n_pos_dims = 3; break;
+	    case ETestbedMode::LidarSdf: n_input_dims = 3; n_output_dims = 1; n_pos_dims = 3; break;
 		case ETestbedMode::Image: n_input_dims = 2; n_output_dims = 3; n_pos_dims = 2; break;
 		case ETestbedMode::Volume:n_input_dims = 3; n_output_dims = 4; n_pos_dims = 3; break;
 		default: throw std::runtime_error{"Invalid mode."};
@@ -1821,8 +1824,10 @@ void Testbed::train(uint32_t n_training_steps, uint32_t batch_size) {
 		switch (m_testbed_mode) {
 			case ETestbedMode::Nerf:  training_prep_nerf(batch_size, n_training_steps, m_training_stream);  break;
 			case ETestbedMode::Sdf:   training_prep_sdf(batch_size, n_training_steps, m_training_stream);   break;
+		    case ETestbedMode::LidarSdf:   training_prep_lidar_sdf(batch_size, n_training_steps, m_training_stream);   break;
 			case ETestbedMode::Image: training_prep_image(batch_size, n_training_steps, m_training_stream); break;
 			case ETestbedMode::Volume:training_prep_volume(batch_size, n_training_steps, m_training_stream); break;
+
 			default: throw std::runtime_error{"Invalid training mode."};
 		}
 
@@ -1847,6 +1852,8 @@ void Testbed::train(uint32_t n_training_steps, uint32_t batch_size) {
 		switch (m_testbed_mode) {
 			case ETestbedMode::Nerf:   train_nerf(batch_size, n_training_steps, m_training_stream);   break;
 			case ETestbedMode::Sdf:    train_sdf(batch_size, n_training_steps, m_training_stream);    break;
+			// Reuse training code
+		    case ETestbedMode::LidarSdf: train_sdf(batch_size, n_training_steps, m_training_stream);    break;
 			case ETestbedMode::Image:  train_image(batch_size, n_training_steps, m_training_stream);  break;
 			case ETestbedMode::Volume: train_volume(batch_size, n_training_steps, m_training_stream); break;
 			default: throw std::runtime_error{"Invalid training mode."};
@@ -1935,6 +1942,49 @@ void Testbed::render_frame(const Matrix<float, 3, 4>& camera_matrix0, const Matr
 				);
 			}
 			break;
+
+		// No gt mesh
+		case ETestbedMode::LidarSdf:
+			{
+				 distance_fun_t distance_fun =
+					(distance_fun_t)[&](uint32_t n_elements, const GPUMemory<Vector3f>& positions, GPUMemory<float>& distances, cudaStream_t stream) {
+						if (n_elements == 0) {
+							return;
+						}
+
+						n_elements = next_multiple(n_elements, BATCH_SIZE_MULTIPLE);
+
+						GPUMatrix<float> positions_matrix((float*)positions.data(), 3, n_elements);
+						GPUMatrix<float> distances_matrix(distances.data(), 1, n_elements);
+						m_network->inference(stream, positions_matrix, distances_matrix);
+					};
+
+				normals_fun_t normals_fun =
+					(normals_fun_t)[&](uint32_t n_elements, const GPUMemory<Vector3f>& positions, GPUMemory<Vector3f>& normals, cudaStream_t stream) {
+						if (n_elements == 0) {
+							return;
+						}
+
+						n_elements = next_multiple(n_elements, BATCH_SIZE_MULTIPLE);
+
+						GPUMatrix<float> positions_matrix((float*)positions.data(), 3, n_elements);
+						GPUMatrix<float> normals_matrix((float*)normals.data(), 3, n_elements);
+						m_network->input_gradient(stream, 0, positions_matrix, normals_matrix);
+					};
+
+				render_sdf(
+					distance_fun,
+					normals_fun,
+					render_buffer,
+					max_res,
+					focal_length,
+					camera_matrix0,
+					screen_center,
+					m_inference_stream
+				);
+			}
+			break;
+
 		case ETestbedMode::Image:
 			render_image(render_buffer, m_inference_stream);
 			break;

@@ -147,6 +147,7 @@ static constexpr const char* TonemapCurveStr = "Identity\0ACES\0Hable\0Reinhard\
 enum class ETestbedMode : int {
 	Nerf,
 	Sdf,
+	LidarSdf,
 	Image,
 	Volume,
 };

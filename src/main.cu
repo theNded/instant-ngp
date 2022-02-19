@@ -154,12 +154,14 @@ int main(int argc, char** argv) {
 				mode = ETestbedMode::Nerf;
 			} else if (equals_case_insensitive(mode_str, "sdf")) {
 				mode = ETestbedMode::Sdf;
+			} else if (equals_case_insensitive(mode_str, "lidarsdf")) {
+				mode = ETestbedMode::LidarSdf;
 			} else if (equals_case_insensitive(mode_str, "image")) {
 				mode = ETestbedMode::Image;
 			} else if (equals_case_insensitive(mode_str, "volume")) {
 				mode = ETestbedMode::Volume;
 			} else {
-				tlog::error() << "Mode must be one of 'nerf', 'sdf', 'image', and 'volume'.";
+				tlog::error() << "Mode must be one of 'nerf', 'sdf', 'lidarsdf', 'image', and 'volume'.";
 				return 1;
 			}
 		}
@@ -182,6 +184,8 @@ int main(int argc, char** argv) {
 		switch (mode) {
 			case ETestbedMode::Nerf:   mode_str = "nerf";   break;
 			case ETestbedMode::Sdf:    mode_str = "sdf";    break;
+			// Reuse configure
+		    case ETestbedMode::LidarSdf:    mode_str = "sdf";    break;
 			case ETestbedMode::Image:  mode_str = "image";  break;
 			case ETestbedMode::Volume: mode_str = "volume"; break;
 		}

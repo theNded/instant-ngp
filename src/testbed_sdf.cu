@@ -965,9 +965,11 @@ void test_load_lidar() {
 	visualization::DrawGeometries({pcd_ptr});
 }
 
-void Testbed::load_mesh() {
+void Testbed::load_posed_lidar_images() {
 	test_load_lidar();
+}
 
+void Testbed::load_mesh() {
 	if (!equals_case_insensitive(m_data_path.extension(), "obj")) {
 		throw std::runtime_error{"Sdf data path must be a mesh in .obj format."};
 	}
@@ -1177,6 +1179,17 @@ void Testbed::train_sdf(size_t target_batch_size, size_t n_steps, cudaStream_t s
 	}
 }
 
+void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
+	if (m_sdf.training.generate_sdf_data_online) {
+		m_sdf.training.size = batch_size*n_training_steps;
+		m_sdf.training.positions.enlarge(m_sdf.training.size);
+		m_sdf.training.positions_shuffled.enlarge(m_sdf.training.size);
+		m_sdf.training.distances.enlarge(m_sdf.training.size);
+		m_sdf.training.distances_shuffled.enlarge(m_sdf.training.size);
+
+		utility::LogInfo("Pass\n");
+	}
+}
 
 void Testbed::training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
 	if (m_sdf.training.generate_sdf_data_online) {

@@ -249,6 +249,7 @@ public:
 	void update_nerf_transforms();
 	void load_nerf();
 	void load_mesh();
+	void load_posed_lidar_images();
 	void set_exposure(float exposure) { m_exposure = exposure; }
 	void set_max_level(float maxlevel);
 	void set_min_level(float minlevel);
@@ -282,6 +283,7 @@ public:
 	void imgui();
 	void training_prep_nerf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream);
 	void training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream);
+	void training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream);
 	void training_prep_image(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {}
 	void train(uint32_t n_training_steps, uint32_t batch_size);
 	Eigen::Vector2f calc_focal_length(const Eigen::Vector2i& resolution, int fov_axis, float zoom) const ;
