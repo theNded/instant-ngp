@@ -936,11 +936,36 @@ void Testbed::render_sdf(
 	}
 }
 
+void test_load_lidar() {
+	using namespace open3d;
+
+	auto device = core::Device("CUDA:0");
+
+	std::string calib_npz = "data/sdf/ouster_calib.npz";
+	t::geometry::LiDARIntrinsic calib(calib_npz, device);
+
+	t::geometry::LiDARImage src =
+		t::io::CreateImageFromFile("data/sdf/000000.png")->To(device);
+
+	core::Tensor xyz_im, mask_im;
+	core::Tensor transformation =
+			core::Tensor::Eye(4, core::Dtype::Float64, core::Device());
+
+	auto vis = src.Visualize(calib);
+	auto vis_ptr = std::make_shared<open3d::geometry::Image>(
+			vis.ColorizeDepth(1000.0, 0.0, 30.0).ToLegacy());
+	visualization::DrawGeometries({vis_ptr});
+
+	std::tie(xyz_im, mask_im) =
+			src.Unproject(calib, transformation, 0.0, 100.0);
+
+	auto pcd_ptr = std::make_shared<open3d::geometry::PointCloud>(
+			t::geometry::PointCloud(xyz_im.IndexGet({mask_im})).ToLegacy());
+	visualization::DrawGeometries({pcd_ptr});
+}
+
 void Testbed::load_mesh() {
-    auto sphere = open3d::geometry::TriangleMesh::CreateSphere(1.0);
-    sphere->ComputeVertexNormals();
-    sphere->PaintUniformColor({0.0, 1.0, 0.0});
-    open3d::visualization::DrawGeometries({sphere});
+	test_load_lidar();
 
 	if (!equals_case_insensitive(m_data_path.extension(), "obj")) {
 		throw std::runtime_error{"Sdf data path must be a mesh in .obj format."};
