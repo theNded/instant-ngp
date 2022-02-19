@@ -38,6 +38,38 @@ using namespace tcnn;
 
 NGP_NAMESPACE_BEGIN
 
+template <typename T, int N>
+static std::vector<Eigen::Matrix<T, N, 1>> TensorToEigenVectorNxVector(
+        const core::Tensor &tensor) {
+    static_assert(
+				  (std::is_same<T, double>::value || std::is_same<T, int>::value || std::is_same<T, float>::value) &&
+                    N > 0,
+            "Only supports double and int (VectorNd and VectorNi) with N>0.");
+    core::Dtype dtype;
+    if (std::is_same<T, double>::value) {
+        dtype = core::Float64;
+    } else if (std::is_same<T, int>::value) {
+        dtype = core::Int32;
+    } else if (std::is_same<T, float>::value) {
+		dtype = core::Float32;
+	}
+
+    if (dtype.ByteSize() * N != sizeof(Eigen::Matrix<T, N, 1>)) {
+        utility::LogError("Internal error: dtype size mismatch {} != {}.",
+                          dtype.ByteSize() * N, sizeof(Eigen::Matrix<T, N, 1>));
+    }
+
+    // Eigen::VectorNx is not a "fixed-size vectorizable Eigen type" thus it is
+    // safe to write directly into std vector memory, see:
+    // https://eigen.tuxfamily.org/dox/group__TopicStlContainers.html.
+    std::vector<Eigen::Matrix<T, N, 1>> eigen_vector(tensor.GetLength());
+    const core::Tensor t = tensor.To(dtype).Contiguous();
+	core::MemoryManager::MemcpyToHost(eigen_vector.data(), t.GetDataPtr(),
+									  t.GetDevice(),
+									  t.GetDtype().ByteSize() * t.NumElements());
+    return eigen_vector;
+}
+
 static constexpr uint32_t MARCH_ITER = 10000;
 static constexpr float MIN_DIST = 0.00005f;
 
@@ -1007,6 +1039,11 @@ void Testbed::load_posed_lidar_images() {
 	utility::LogInfo("AABB intersects with (0, 1)={}", m_aabb);
 
 	m_render_aabb = m_aabb;
+	m_mesh.thresh = 0.f;
+
+	m_sdf.training.idx = 0;
+	m_sdf.training.size = 0;
+
 }
 
 void Testbed::load_mesh() {
@@ -1222,12 +1259,96 @@ void Testbed::train_sdf(size_t target_batch_size, size_t n_steps, cudaStream_t s
 void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
 	if (m_sdf.training.generate_sdf_data_online) {
 		m_sdf.training.size = batch_size*n_training_steps;
+
+		// TODO: make it configurable?
+		// 2 negative, 1 zero, 2 positive samples
+		int samples_per_ray = 5;
+
+		core::Device device("CUDA:0");
+		t::geometry::LiDARIntrinsic intrinsic(m_sdf.lidar_intrinsic_fname, device);
+		int rays_per_image = intrinsic.width_ * intrinsic.height_;
+
+		int sample_images = m_sdf.training.size / (samples_per_ray * rays_per_image);
+
+		int n_images = m_sdf.depth_fnames.size();
+		utility::UniformRandIntGenerator rand_generator(0, n_images - 1, 15213);
+
+		// TODO: more randomized
+		// Now: in meter
+		std::vector<float> sdf_offsets{0, 0.01, 0.05, 0.3, -0.005, -0.01};
+
+		auto center = 0.5 * (m_raw_aabb.min + m_raw_aabb.max);
+		auto tcenter = core::Tensor(std::vector<float>{center(0), center(1), center(2)}, {1, 3}, core::Dtype::Float32, device);
+		auto toffset = core::Tensor::Full({1, 3}, 0.5f, core::Dtype::Float32, device);
+
+		float scale = m_sdf.mesh_scale;
+
+		// int position_samples = 0;
+		std::vector<Vector3f> positions_host;
+		std::vector<float> distances_host;
+		for (int k = 0; k < sample_images; ++k) {
+			int i = rand_generator();
+
+			core::Tensor depth_data =
+				t::io::CreateImageFromFile(m_sdf.depth_fnames[i])->To(device).AsTensor();
+			auto pose = core::eigen_converter::EigenMatrixToTensor(m_sdf.lidar_poses[i]);
+
+			core::Tensor xyz_im, mask_im;
+			std::tie(xyz_im, mask_im) =
+				t::geometry::LiDARImage(depth_data).Unproject(intrinsic, pose, 0.65, 30.0);
+
+			for (auto sdf_offset : sdf_offsets) {
+				t::geometry::LiDARImage depth(depth_data - (sdf_offset * m_sdf.mesh_scale) * 1000);
+
+				core::Tensor mask_tmp;
+				std::tie(xyz_im, mask_tmp) =
+					depth.Unproject(intrinsic, pose, 0.65, 30.0);
+
+				auto xyz = xyz_im.IndexGet({mask_im});
+				xyz = (xyz - tcenter) / scale + toffset;
+				utility::LogInfo("xyz.Shape: {}", xyz.GetShape());
+
+				// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy())});
+
+				auto positions_i = TensorToEigenVectorNxVector<float, 3>(xyz);
+
+				positions_host.insert(positions_host.end(), positions_i.begin(), positions_i.end());
+				distances_host.insert(distances_host.end(), positions_i.size(), sdf_offset);
+			}
+		}
+
+		m_sdf.training.size = positions_host.size();
+
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
-		m_sdf.training.positions_shuffled.enlarge(m_sdf.training.size);
 		m_sdf.training.distances.enlarge(m_sdf.training.size);
+		m_sdf.training.positions.copy_from_host(positions_host);
+		m_sdf.training.distances.copy_from_host(distances_host);
+
+		auto stream = m_training_stream;
+		m_sdf.training.perturbations.enlarge(m_sdf.training.size);
+		float stddev = 0.1;
+		generate_random_logistic<float>(stream, m_rng, m_sdf.training.size, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
+		linear_kernel(perturb_sdf_samples, 0, stream,
+					  m_sdf.training.size,
+					  m_sdf.training.perturbations.data(),
+					  m_sdf.training.positions.data(),
+					  m_sdf.training.distances.data()
+					  );
+
+
+		// They will be set elsewhere
+		m_sdf.training.positions_shuffled.enlarge(m_sdf.training.size);
 		m_sdf.training.distances_shuffled.enlarge(m_sdf.training.size);
 
-		utility::LogInfo("Pass\n");
+		std::vector<Vector3f> positions_show(m_sdf.training.size);
+		std::vector<float> distances_show(m_sdf.training.size);
+
+		m_sdf.training.positions.copy_to_host(positions_show);
+		m_sdf.training.distances.copy_to_host(distances_show);
+
+		auto d = core::Tensor(distances_show, core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
+		utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
+
 	}
 }
 
