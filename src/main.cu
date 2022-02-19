@@ -172,6 +172,9 @@ int main(int argc, char** argv) {
 				tlog::error() << "Scene path " << scene_path << " does not exist.";
 				return 1;
 			}
+
+			// COMMENT: in Sdf mode load_mesh is called.
+			// TODO: implement load_posed_lidar_image() instead of load_mesh()
 			testbed.load_training_data(scene_path.str());
 		}
 
@@ -226,6 +229,10 @@ int main(int argc, char** argv) {
 		}
 
 		// Render/training loop
+		// COMMENT: calling chaing: frame() -> draw_contents() -> train()
+		// In Sdf mode: training_prep_sdf(), train_sdf()
+		// training_prep_sdf() -> generate_training_samples_sdf()
+		// TODO: modify generate_training_samples_sdf()
 		while (testbed.frame()) {
 			if (!gui) {
 				tlog::info() << "iteration=" << testbed.m_training_step << " loss=" << testbed.m_loss_scalar;

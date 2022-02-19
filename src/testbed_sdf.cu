@@ -32,6 +32,7 @@
 
 #include "open3d/Open3D.h"
 
+using namespace open3d;
 using namespace Eigen;
 using namespace tcnn;
 
@@ -1057,6 +1058,11 @@ void Testbed::generate_training_samples_sdf(Vector3f* positions, float* distance
 		positions
 	);
 
+	// COMMENT:
+	// https://github.com/NVlabs/tiny-cuda-nn/blob/master/include/tiny-cuda-nn/gpu_memory.h
+	// positions: m_sdf.training.positions.data(), tcnn::GPUMemory<Eigen::Vector3f>
+	// distances: m_sdf.training.distances.data(), tcnn::GPUMemory<float>
+
 	// The distances of points on the mesh are zero. Can immediately set.
 	CUDA_CHECK_THROW(cudaMemsetAsync(distances, 0, n_to_generate_surface_exact*sizeof(float), stream));
 
@@ -1181,6 +1187,15 @@ void Testbed::training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, 
 		m_sdf.training.distances_shuffled.enlarge(m_sdf.training.size);
 
 		generate_training_samples_sdf(m_sdf.training.positions.data(), m_sdf.training.distances.data(), batch_size*n_training_steps, stream, false);
+
+		std::vector<Vector3f> positions_host(m_sdf.training.size);
+		std::vector<float> distances_host(m_sdf.training.size);
+
+		m_sdf.training.positions.copy_to_host(positions_host);
+		m_sdf.training.distances.copy_to_host(distances_host);
+
+		auto d = core::Tensor(distances_host, core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
+		utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
 	}
 }
 
