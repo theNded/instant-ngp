@@ -275,7 +275,7 @@ public:
 	void reset_camera();
 	bool keyboard_event();
 	void generate_training_samples_sdf(Eigen::Vector3f* positions, float* distances, uint32_t n_to_generate, cudaStream_t stream, bool uniform_only);
-	void generate_training_samples_lidar_sdf(Eigen::Vector3f* positions, float* distances, uint32_t n_to_generate, cudaStream_t stream, bool uniform_only);
+	void generate_training_samples_lidar_sdf(uint32_t n_to_generate, cudaStream_t stream, bool uniform_only);
 	void update_density_grid_nerf(float decay, uint32_t n_uniform_density_grid_samples, uint32_t n_nonuniform_density_grid_samples, cudaStream_t stream);
 	void update_density_grid_mean_and_bitfield(cudaStream_t stream);
 	void train_nerf(uint32_t target_batch_size, uint32_t n_training_steps, cudaStream_t stream);
