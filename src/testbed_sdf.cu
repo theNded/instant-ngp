@@ -1256,6 +1256,19 @@ void Testbed::train_sdf(size_t target_batch_size, size_t n_steps, cudaStream_t s
 	}
 }
 
+__global__ void copy_samples(uint32_t n_elements, const float* __restrict__ tensor_positions, const float* __restrict__ tensor_distances, Vector3f* __restrict__ positions, float* distances) {
+	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n_elements) return;
+
+	float x = tensor_positions[3 * i + 0];
+	float y = tensor_positions[3 * i + 1];
+	float z = tensor_positions[3 * i + 2];
+	Vector3f position(x, y, z);
+
+	positions[i] = position;
+	distances[i] = tensor_distances[i];
+}
+
 void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
 	if (m_sdf.training.generate_sdf_data_online) {
 		m_sdf.training.size = batch_size*n_training_steps;
@@ -1306,7 +1319,6 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 
 				auto xyz = xyz_im.IndexGet({mask_im});
 				xyz = (xyz - tcenter) / scale + toffset;
-				utility::LogInfo("xyz.Shape: {}", xyz.GetShape());
 
 				// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy())});
 
@@ -1321,10 +1333,21 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
 		m_sdf.training.distances.enlarge(m_sdf.training.size);
-		m_sdf.training.positions.copy_from_host(positions_host);
-		m_sdf.training.distances.copy_from_host(distances_host);
 
+		// m_sdf.training.positions.copy_from_host(positions_host);
+		// m_sdf.training.distances.copy_from_host(distances_host);
 		auto stream = m_training_stream;
+
+		core::Tensor positions((float*)positions_host.data(), {int64_t(m_sdf.training.size), 3}, core::Dtype::Float32, device);
+		core::Tensor distances((float*)distances_host.data(), {int64_t(m_sdf.training.size)}, core::Dtype::Float32, device);
+		linear_kernel(copy_samples, 0, stream,
+					  m_sdf.training.size,
+					  positions.GetDataPtr<float>(),
+					  distances.GetDataPtr<float>(),
+					  m_sdf.training.positions.data(),
+					  m_sdf.training.distances.data()
+					  );
+
 		m_sdf.training.perturbations.enlarge(m_sdf.training.size);
 		float stddev = 0.1;
 		generate_random_logistic<float>(stream, m_rng, m_sdf.training.size, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
@@ -1347,7 +1370,7 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 		m_sdf.training.distances.copy_to_host(distances_show);
 
 		auto d = core::Tensor(distances_show, core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
-		utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
+		// utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
 
 	}
 }
