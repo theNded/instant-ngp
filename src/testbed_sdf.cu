@@ -1188,6 +1188,8 @@ void Testbed::generate_training_samples_sdf(Vector3f* positions, float* distance
 		);
 	}
 
+	utility::LogInfo("stddev = {}", stddev);
+
 	m_sdf.training.perturbations.enlarge(n_to_generate_surface_offset);
 	generate_random_logistic<float>(stream, m_rng, n_to_generate_surface_offset*3, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
 
@@ -1260,6 +1262,9 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 	if (m_sdf.training.generate_sdf_data_online) {
 		m_sdf.training.size = batch_size*n_training_steps;
 
+		// TODO: first uniformly generate random examples, then project them back to range images and acquire sdf measurements (min over all frames)
+		// further TODO: use ASH to roughly locate positions, then process above
+
 		// TODO: make it configurable?
 		// 2 negative, 1 zero, 2 positive samples
 		int samples_per_ray = 5;
@@ -1306,7 +1311,6 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 
 				auto xyz = xyz_im.IndexGet({mask_im});
 				xyz = (xyz - tcenter) / scale + toffset;
-				utility::LogInfo("xyz.Shape: {}", xyz.GetShape());
 
 				// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy())});
 
@@ -1346,9 +1350,10 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 		m_sdf.training.positions.copy_to_host(positions_show);
 		m_sdf.training.distances.copy_to_host(distances_show);
 
-		auto d = core::Tensor(distances_show, core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
-		utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
-
+		auto aabb_ptr = std::make_shared<geometry::AxisAlignedBoundingBox>(m_aabb.min.cast<double>(), m_aabb.max.cast<double>());
+		aabb_ptr->color_ = Eigen::Vector3d(1, 0, 0);
+		auto t_positions_show = core::Tensor((float*)positions_show.data(), {int64_t(positions_show.size()), 3}, core::Dtype::Float32);
+		visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(t_positions_show).ToLegacy()), aabb_ptr});
 	}
 }
 
@@ -1362,14 +1367,18 @@ void Testbed::training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, 
 
 		generate_training_samples_sdf(m_sdf.training.positions.data(), m_sdf.training.distances.data(), batch_size*n_training_steps, stream, false);
 
+		/// Visualize the sampled positions
 		std::vector<Vector3f> positions_host(m_sdf.training.size);
 		std::vector<float> distances_host(m_sdf.training.size);
 
 		m_sdf.training.positions.copy_to_host(positions_host);
 		m_sdf.training.distances.copy_to_host(distances_host);
 
-		auto d = core::Tensor(distances_host, core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
-		utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
+		auto aabb_ptr = std::make_shared<geometry::AxisAlignedBoundingBox>(m_aabb.min.cast<double>(), m_aabb.max.cast<double>());
+		aabb_ptr->color_ = Eigen::Vector3d(1, 0, 0);
+
+		auto t_positions_show = core::Tensor((float*)positions_host.data(), {int64_t(positions_host.size()), 3}, core::Dtype::Float32);
+		visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(t_positions_show).ToLegacy()), aabb_ptr});
 	}
 }
 
