@@ -1299,6 +1299,9 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 		// int position_samples = 0;
 		std::vector<Vector3f> positions_host;
 		std::vector<float> distances_host;
+
+		core::Tensor positions({0, 3}, core::Dtype::Float32, device);
+		core::Tensor distances({0}, core::Dtype::Float32, device);
 		for (int k = 0; k < sample_images; ++k) {
 			int i = rand_generator();
 
@@ -1320,26 +1323,21 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 				auto xyz = xyz_im.IndexGet({mask_im});
 				xyz = (xyz - tcenter) / scale + toffset;
 
+				auto distance = core::Tensor::Zeros({xyz.GetLength()}, core::Dtype::Float32, device);
+
+				positions = positions.Append(xyz, 0);
+				distances = distances.Append(distance, 0);
+
 				// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy())});
-
-				auto positions_i = TensorToEigenVectorNxVector<float, 3>(xyz);
-
-				positions_host.insert(positions_host.end(), positions_i.begin(), positions_i.end());
-				distances_host.insert(distances_host.end(), positions_i.size(), sdf_offset);
 			}
 		}
 
-		m_sdf.training.size = positions_host.size();
-
+		m_sdf.training.size = positions.GetLength();
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
 		m_sdf.training.distances.enlarge(m_sdf.training.size);
 
-		// m_sdf.training.positions.copy_from_host(positions_host);
-		// m_sdf.training.distances.copy_from_host(distances_host);
 		auto stream = m_training_stream;
 
-		core::Tensor positions((float*)positions_host.data(), {int64_t(m_sdf.training.size), 3}, core::Dtype::Float32, device);
-		core::Tensor distances((float*)distances_host.data(), {int64_t(m_sdf.training.size)}, core::Dtype::Float32, device);
 		linear_kernel(copy_samples, 0, stream,
 					  m_sdf.training.size,
 					  positions.GetDataPtr<float>(),
@@ -1362,16 +1360,6 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 		// They will be set elsewhere
 		m_sdf.training.positions_shuffled.enlarge(m_sdf.training.size);
 		m_sdf.training.distances_shuffled.enlarge(m_sdf.training.size);
-
-		std::vector<Vector3f> positions_show(m_sdf.training.size);
-		std::vector<float> distances_show(m_sdf.training.size);
-
-		m_sdf.training.positions.copy_to_host(positions_show);
-		m_sdf.training.distances.copy_to_host(distances_show);
-
-		auto d = core::Tensor(distances_show, core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
-		// utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
-
 	}
 }
 
