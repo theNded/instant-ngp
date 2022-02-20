@@ -1269,26 +1269,29 @@ __global__ void copy_samples(uint32_t n_elements, const float* __restrict__ tens
 	distances[i] = tensor_distances[i];
 }
 
+__global__ void perturb_samples(uint32_t n_elements, const Vector3f* __restrict__ perturbations, float* __restrict__ tensor_positions, float* __restrict__ tensor_distances) {
+	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n_elements) return;
+
+	Vector3f perturb = perturbations[i];
+
+	tensor_positions[3 * i + 0] += perturb(0);
+	tensor_positions[3 * i + 1] += perturb(1);
+	tensor_positions[3 * i + 2] += perturb(2);
+
+	tensor_distances[i] = perturb.norm() * 1.001f;
+}
+
 void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
 	if (m_sdf.training.generate_sdf_data_online) {
 		m_sdf.training.size = batch_size*n_training_steps;
 
-		// TODO: make it configurable?
-		// 2 negative, 1 zero, 2 positive samples
-		int samples_per_ray = 5;
-
 		core::Device device("CUDA:0");
 		t::geometry::LiDARIntrinsic intrinsic(m_sdf.lidar_intrinsic_fname, device);
-		int rays_per_image = intrinsic.width_ * intrinsic.height_;
 
-		int sample_images = m_sdf.training.size / (samples_per_ray * rays_per_image);
-
+		int sample_images = 16;
 		int n_images = m_sdf.depth_fnames.size();
 		utility::UniformRandIntGenerator rand_generator(0, n_images - 1, 15213);
-
-		// TODO: more randomized
-		// Now: in meter
-		std::vector<float> sdf_offsets{0, 0.01, 0.05, 0.3, -0.005, -0.01};
 
 		auto center = 0.5 * (m_raw_aabb.min + m_raw_aabb.max);
 		auto tcenter = core::Tensor(std::vector<float>{center(0), center(1), center(2)}, {1, 3}, core::Dtype::Float32, device);
@@ -1312,31 +1315,37 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 			core::Tensor xyz_im, mask_im;
 			std::tie(xyz_im, mask_im) =
 				t::geometry::LiDARImage(depth_data).Unproject(intrinsic, pose, 0.65, 30.0);
+			auto xyz = xyz_im.IndexGet({mask_im});
+			xyz = (xyz - tcenter) / scale + toffset;
+			xyz = xyz.Contiguous();
 
-			for (auto sdf_offset : sdf_offsets) {
-				t::geometry::LiDARImage depth(depth_data - (sdf_offset * m_sdf.mesh_scale) * 1000);
+			auto distance = core::Tensor::Full({xyz.GetLength()}, 0, core::Dtype::Float32, device);
 
-				core::Tensor mask_tmp;
-				std::tie(xyz_im, mask_tmp) =
-					depth.Unproject(intrinsic, pose, 0.65, 30.0);
+			// Perturb directly on Tensor
+			// TODO: perturb on the range image according to ray-dot product
+			float stddev = 0.1;
+			m_sdf.training.perturbations.enlarge(xyz.GetLength());
 
-				auto xyz = xyz_im.IndexGet({mask_im});
-				xyz = (xyz - tcenter) / scale + toffset;
+			// Keep 2/3 unchanged and perturb 1/3
+			int num_perturb_samples = xyz.GetLength() / 3;
 
-				auto distance = core::Tensor::Zeros({xyz.GetLength()}, core::Dtype::Float32, device);
+			generate_random_logistic<float>(stream, m_rng, num_perturb_samples*3, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
+			linear_kernel(perturb_samples, 0, stream,
+						  num_perturb_samples,
+						  m_sdf.training.perturbations.data(),
+						  xyz.GetDataPtr<float>(),
+						  distance.GetDataPtr<float>()
+						  );
 
-				positions = positions.Append(xyz, 0);
-				distances = distances.Append(distance, 0);
-
-				// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy())});
-			}
+			positions = positions.Append(xyz, 0);
+			distances = distances.Append(distance, 0);
 		}
+
+		// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(positions).ToLegacy())});
 
 		m_sdf.training.size = positions.GetLength();
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
 		m_sdf.training.distances.enlarge(m_sdf.training.size);
-
-		auto stream = m_training_stream;
 
 		linear_kernel(copy_samples, 0, stream,
 					  m_sdf.training.size,
@@ -1345,17 +1354,6 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 					  m_sdf.training.positions.data(),
 					  m_sdf.training.distances.data()
 					  );
-
-		m_sdf.training.perturbations.enlarge(m_sdf.training.size);
-		float stddev = 0.1;
-		generate_random_logistic<float>(stream, m_rng, m_sdf.training.size, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
-		linear_kernel(perturb_sdf_samples, 0, stream,
-					  m_sdf.training.size,
-					  m_sdf.training.perturbations.data(),
-					  m_sdf.training.positions.data(),
-					  m_sdf.training.distances.data()
-					  );
-
 
 		// They will be set elsewhere
 		m_sdf.training.positions_shuffled.enlarge(m_sdf.training.size);
