@@ -31,6 +31,7 @@
 #include <tiny-cuda-nn/trainer.h>
 
 #include "open3d/Open3D.h"
+#include "open3d/core/CUDAUtils.h"
 
 using namespace open3d;
 using namespace Eigen;
@@ -1039,6 +1040,9 @@ void Testbed::load_posed_lidar_images() {
 	utility::LogInfo("AABB intersects with (0, 1)={}", m_aabb);
 
 	m_render_aabb = m_aabb;
+	m_bounding_radius = Vector3f::Constant(0.5f).norm();
+	set_scale(m_bounding_radius * 1.5f);
+
 	m_mesh.thresh = 0.f;
 
 	m_sdf.training.idx = 0;
@@ -1258,102 +1262,207 @@ void Testbed::train_sdf(size_t target_batch_size, size_t n_steps, cudaStream_t s
 	}
 }
 
+__global__ void transform_uniform_samples(uint32_t n_elements, const Vector3f* __restrict__ uniform_input, float* __restrict__ tensor_positions, BoundingBox aabb) {
+	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n_elements) return;
+
+	Vector3f position = uniform_input[i].cwiseProduct(aabb.diag()) + aabb.min;
+	tensor_positions[3 * i + 0] = position(0);
+	tensor_positions[3 * i + 1] = position(1);
+	tensor_positions[3 * i + 2] = position(2);
+}
+
+__global__ void perturb_surface_samples(uint32_t n_elements, const Vector3f* __restrict__ perturbations, float* __restrict__ tensor_positions) {
+	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n_elements) return;
+
+	Vector3f perturbation = perturbations[i];
+	tensor_positions[3 * i + 0] += perturbation(0);
+	tensor_positions[3 * i + 1] += perturbation(1);
+	tensor_positions[3 * i + 2] += perturbation(2);
+}
+
+__global__ void copy_samples(uint32_t n_elements, const float* __restrict__ tensor_positions, const float* __restrict__ tensor_distances, Vector3f* __restrict__ positions, float* distances, Vector3f center, float scale) {
+	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n_elements) return;
+
+	float x = tensor_positions[3 * i + 0];
+	float y = tensor_positions[3 * i + 1];
+	float z = tensor_positions[3 * i + 2];
+	Vector3f position(x, y, z);
+
+	positions[i] = (position - center) / scale + Vector3f(0.5, 0.5, 0.5);
+	distances[i] = tensor_distances[i];
+}
+
+void Testbed::generate_training_samples_lidar_sdf(Eigen::Vector3f* positions, float* distances, uint32_t n_to_generate, cudaStream_t stream, bool uniform_only) {
+	uint32_t n_to_generate_base = n_to_generate / 8;
+	const uint32_t n_to_generate_surface_exact = n_to_generate_base*4;
+	const uint32_t n_to_generate_surface_offset = n_to_generate_base*3;
+	const uint32_t n_to_generate_uniform = n_to_generate_base*1;
+
+	uint32_t n_to_generate_surface = n_to_generate_surface_exact + n_to_generate_surface_offset;
+
+	// 1. sample 4/8+3/8=7/8 on LiDAR point clouds --> sdf = 0
+	// 2. offset the 3/8 of them by purturbation
+	// 3. distrubite the rest 1/8 uniformly
+	// 4. compute sdf for the 7/8
+	int n_images = m_sdf.depth_fnames.size();
+	utility::UniformRandIntGenerator rand_generator(0, n_images - 1, 15213);
+
+	auto device = core::Device("CUDA:0");
+	t::geometry::LiDARIntrinsic intrinsic(m_sdf.lidar_intrinsic_fname, device);
+
+	// TODO: remember to rescale !!!
+	auto surface_xyz = core::Tensor::Empty({0, 3}, core::Dtype::Float32, device);
+
+	std::vector<int> sampled_image_indices;
+
+	while (n_to_generate_surface > 0) {
+		int i = rand_generator();
+		sampled_image_indices.emplace_back(i);
+
+		core::Tensor depth_data =
+			t::io::CreateImageFromFile(m_sdf.depth_fnames[i])->To(device).AsTensor();
+		auto pose = core::eigen_converter::EigenMatrixToTensor(m_sdf.lidar_poses[i]);
+
+		core::Tensor xyz_im, mask_im;
+		std::tie(xyz_im, mask_im) =
+			t::geometry::LiDARImage(depth_data).Unproject(intrinsic, pose, 0.65, 30.0);
+
+		auto xyz = xyz_im.IndexGet({mask_im});
+		int xyz_len = xyz.GetLength();
+
+		auto selected = std::min(xyz_len, int(n_to_generate_surface));
+		surface_xyz = surface_xyz.Append(xyz.Slice(0, 0, selected), 0);
+		n_to_generate_surface -= selected;
+	}
+	n_to_generate_surface = n_to_generate_surface_exact + n_to_generate_surface_offset;
+
+	// part 1: exact samples, correpsonding SDF: 0
+	auto exact_surface_xyz = surface_xyz.Slice(0, 0, n_to_generate_surface_exact, 1);
+	auto exact_surface_sdf = core::Tensor::Zeros({n_to_generate_surface_exact}, core::Dtype::Float32, device);
+
+	// part 2: near-surface samples, corresponding SDF: to be computed
+	auto offset_surface_xyz = surface_xyz.Slice(0, n_to_generate_surface_exact, n_to_generate_surface, 1);
+	// Perturb the offset part (correpsonding to part 2)
+	float stddev = m_sdf.mesh_scale /256.0f; // * 8.f;
+	m_sdf.training.perturbations.enlarge(n_to_generate_surface_offset);
+	generate_random_logistic<float>(stream, m_rng, n_to_generate_surface_offset*3, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
+	linear_kernel(perturb_surface_samples, 0, stream,
+				  n_to_generate_surface_offset,
+				  m_sdf.training.perturbations.data(),
+				  offset_surface_xyz.GetDataPtr<float>());
+
+	// part 3: uniform samples, corresponding SDF: to be computed
+	// First reuse the buffer to generate uniform data
+	auto uniform_xyz = core::Tensor::Empty({n_to_generate_uniform, 3}, core::Dtype::Float32, device);
+	generate_random_uniform<float>(stream, m_rng, n_to_generate_uniform*3, (float*)positions);
+	// Then transform them to uniform_xyz
+	linear_kernel(transform_uniform_samples, 0, stream,
+				  n_to_generate_uniform,
+				  positions,
+				  uniform_xyz.GetDataPtr<float>(),
+				  m_raw_aabb);
+
+	// now compute SDF for part 2 and 3
+	auto trunc = stddev * 3;
+
+	auto off_surface_xyz = offset_surface_xyz.Append(uniform_xyz, 0).Contiguous();
+	auto off_surface_sdfs = core::Tensor::Ones({off_surface_xyz.GetLength()}, core::Dtype::Float32, device);
+	auto off_surface_weights = core::Tensor::Zeros({off_surface_xyz.GetLength()}, core::Dtype::Float32, device);
+	auto off_surface_indices = core::Tensor::Arange(0, off_surface_xyz.GetLength(), 1, core::Dtype::Int64, device);
+
+	core::Tensor u, v, r, mask;
+	utility::LogInfo("Sampled {} images", sampled_image_indices.size());
+
+	int i = 0;
+
+	core::Tensor depth_data =
+		t::io::CreateImageFromFile(m_sdf.depth_fnames[i])->To(device).AsTensor();
+
+	auto extrinsic = core::eigen_converter::EigenMatrixToTensor(m_sdf.lidar_poses[i].inverse());
+	std::tie(u, v, r, mask) = t::geometry::LiDARImage::Project(off_surface_xyz, intrinsic, extrinsic);
+	auto u_i = u.IndexGet({mask});
+	auto v_i = v.IndexGet({mask});
+	auto r_i = r.IndexGet({mask});
+	auto d_i = depth_data.IndexGet({v_i, u_i}).View({-1}).To(core::Float32) / 1000.0;
+
+	auto sdf = d_i - r_i;
+	// auto mask_sdf_near = sdf.Gt(trunc);
+	// sdf.IndexSet({mask_sdf_near}, core::Tensor(std::vector<float>{trunc}, {}, core::Dtype::Float32, device));
+	// auto mask_sdf_far = sdf.Le(-trunc);
+	// sdf.IndexSet({mask_sdf_far}, core::Tensor(std::vector<float>{-trunc}, {}, core::Dtype::Float32, device));
+	// sdf /= trunc;
+
+	auto valid_i = d_i.Gt(0);
+	auto sdf_i = sdf.IndexGet({valid_i});
+	auto indices_i = off_surface_indices.IndexGet({mask}).IndexGet({valid_i});
+
+	auto weight_prev = off_surface_weights.IndexGet({indices_i});
+	auto weight_curr = weight_prev + 1;
+
+	auto sdf_prev = off_surface_sdfs.IndexGet({indices_i});
+	auto sdf_curr = (sdf_prev * weight_prev + sdf_i) / weight_curr;
+
+	// Element-wise minimum
+	off_surface_sdfs.IndexSet({indices_i}, sdf_curr);
+	off_surface_weights.IndexSet({indices_i}, weight_curr);
+
+	core::cuda::ReleaseCache();
+
+	// Aggregate all the tensors and distances
+	auto all_xyz = surface_xyz.Append(uniform_xyz, 0).Contiguous();
+	auto all_sdf = exact_surface_sdf.Append(off_surface_sdfs, 0).Contiguous();
+	all_sdf = all_sdf * (1.0 / m_sdf.mesh_scale);
+
+
+	// Debug
+	// auto exact_pcd = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(exact_surface_xyz).ToLegacy());
+	// exact_pcd->PaintUniformColor(Eigen::Vector3d(1, 0, 0));
+
+	// auto offset_pcd = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(offset_surface_xyz).ToLegacy());
+	// offset_pcd->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
+
+	// auto uniform_pcd = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(uniform_xyz).ToLegacy());
+	// uniform_pcd->PaintUniformColor(Eigen::Vector3d(0, 1, 0));
+
+	// visualization::DrawGeometries({exact_pcd, offset_pcd, uniform_pcd});
+
+	// Now compute truncated SDF
+
+	linear_kernel(copy_samples, 0, stream,
+				  n_to_generate,
+				  all_xyz.GetDataPtr<float>(),
+				  all_sdf.GetDataPtr<float>(),
+				  positions,
+				  distances,
+				  0.5 * (m_raw_aabb.min + m_raw_aabb.max),
+				  m_sdf.mesh_scale);
+}
+
 void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
 	if (m_sdf.training.generate_sdf_data_online) {
 		m_sdf.training.size = batch_size*n_training_steps;
-
-		// TODO: first uniformly generate random examples, then project them back to range images and acquire sdf measurements (min over all frames)
-		// further TODO: use ASH to roughly locate positions, then process above
-
-		// TODO: make it configurable?
-		// 2 negative, 1 zero, 2 positive samples
-		int samples_per_ray = 5;
-
-		core::Device device("CUDA:0");
-		t::geometry::LiDARIntrinsic intrinsic(m_sdf.lidar_intrinsic_fname, device);
-		int rays_per_image = intrinsic.width_ * intrinsic.height_;
-
-		int sample_images = m_sdf.training.size / (samples_per_ray * rays_per_image);
-
-		int n_images = m_sdf.depth_fnames.size();
-		utility::UniformRandIntGenerator rand_generator(0, n_images - 1, 15213);
-
-		// TODO: more randomized
-		// Now: in meter
-		std::vector<float> sdf_offsets{0, 0.01, 0.05, 0.3, -0.005, -0.01};
-
-		auto center = 0.5 * (m_raw_aabb.min + m_raw_aabb.max);
-		auto tcenter = core::Tensor(std::vector<float>{center(0), center(1), center(2)}, {1, 3}, core::Dtype::Float32, device);
-		auto toffset = core::Tensor::Full({1, 3}, 0.5f, core::Dtype::Float32, device);
-
-		float scale = m_sdf.mesh_scale;
-
-		// int position_samples = 0;
-		std::vector<Vector3f> positions_host;
-		std::vector<float> distances_host;
-		for (int k = 0; k < sample_images; ++k) {
-			int i = rand_generator();
-
-			core::Tensor depth_data =
-				t::io::CreateImageFromFile(m_sdf.depth_fnames[i])->To(device).AsTensor();
-			auto pose = core::eigen_converter::EigenMatrixToTensor(m_sdf.lidar_poses[i]);
-
-			core::Tensor xyz_im, mask_im;
-			std::tie(xyz_im, mask_im) =
-				t::geometry::LiDARImage(depth_data).Unproject(intrinsic, pose, 0.65, 30.0);
-
-			for (auto sdf_offset : sdf_offsets) {
-				t::geometry::LiDARImage depth(depth_data - (sdf_offset * m_sdf.mesh_scale) * 1000);
-
-				core::Tensor mask_tmp;
-				std::tie(xyz_im, mask_tmp) =
-					depth.Unproject(intrinsic, pose, 0.65, 30.0);
-
-				auto xyz = xyz_im.IndexGet({mask_im});
-				xyz = (xyz - tcenter) / scale + toffset;
-
-				// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy())});
-
-				auto positions_i = TensorToEigenVectorNxVector<float, 3>(xyz);
-
-				positions_host.insert(positions_host.end(), positions_i.begin(), positions_i.end());
-				distances_host.insert(distances_host.end(), positions_i.size(), sdf_offset);
-			}
-		}
-
-		m_sdf.training.size = positions_host.size();
-
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
-		m_sdf.training.distances.enlarge(m_sdf.training.size);
-		m_sdf.training.positions.copy_from_host(positions_host);
-		m_sdf.training.distances.copy_from_host(distances_host);
-
-		auto stream = m_training_stream;
-		m_sdf.training.perturbations.enlarge(m_sdf.training.size);
-		float stddev = 0.1;
-		generate_random_logistic<float>(stream, m_rng, m_sdf.training.size, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
-		linear_kernel(perturb_sdf_samples, 0, stream,
-					  m_sdf.training.size,
-					  m_sdf.training.perturbations.data(),
-					  m_sdf.training.positions.data(),
-					  m_sdf.training.distances.data()
-					  );
-
-
-		// They will be set elsewhere
 		m_sdf.training.positions_shuffled.enlarge(m_sdf.training.size);
+		m_sdf.training.distances.enlarge(m_sdf.training.size);
 		m_sdf.training.distances_shuffled.enlarge(m_sdf.training.size);
 
-		std::vector<Vector3f> positions_show(m_sdf.training.size);
-		std::vector<float> distances_show(m_sdf.training.size);
+		generate_training_samples_lidar_sdf(m_sdf.training.positions.data(), m_sdf.training.distances.data(), batch_size*n_training_steps, stream, false);
 
-		m_sdf.training.positions.copy_to_host(positions_show);
-		m_sdf.training.distances.copy_to_host(distances_show);
+		/// Visualize the sampled positions
+		// std::vector<Vector3f> positions_host(m_sdf.training.size);
+		// std::vector<float> distances_host(m_sdf.training.size);
 
-		auto aabb_ptr = std::make_shared<geometry::AxisAlignedBoundingBox>(m_aabb.min.cast<double>(), m_aabb.max.cast<double>());
-		aabb_ptr->color_ = Eigen::Vector3d(1, 0, 0);
-		auto t_positions_show = core::Tensor((float*)positions_show.data(), {int64_t(positions_show.size()), 3}, core::Dtype::Float32);
-		visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(t_positions_show).ToLegacy()), aabb_ptr});
+		// m_sdf.training.positions.copy_to_host(positions_host);
+		// m_sdf.training.distances.copy_to_host(distances_host);
+
+		// auto aabb_ptr = std::make_shared<geometry::AxisAlignedBoundingBox>(m_aabb.min.cast<double>(), m_aabb.max.cast<double>());
+		// aabb_ptr->color_ = Eigen::Vector3d(1, 0, 0);
+
+		// auto t_positions_show = core::Tensor((float*)positions_host.data(), {int64_t(positions_host.size()), 3}, core::Dtype::Float32);
+		// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(t_positions_show).ToLegacy()), aabb_ptr});
 	}
 }
 
