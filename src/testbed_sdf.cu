@@ -1294,7 +1294,7 @@ __global__ void copy_samples(uint32_t n_elements, const float* __restrict__ tens
 	distances[i] = tensor_distances[i];
 }
 
-__global__ void perturb_samples(uint32_t n_elements, const Vector3f* __restrict__ perturbations, float* __restrict__ tensor_positions, float* __restrict__ tensor_distances) {
+__global__ void perturb_samples(uint32_t n_elements, const Vector3f* __restrict__ perturbations, float* __restrict__ tensor_positions, float* __restrict__ tensor_normals, float* __restrict__ tensor_distances) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n_elements) return;
 
@@ -1304,7 +1304,9 @@ __global__ void perturb_samples(uint32_t n_elements, const Vector3f* __restrict_
 	tensor_positions[3 * i + 1] += perturb(1);
 	tensor_positions[3 * i + 2] += perturb(2);
 
-	tensor_distances[i] = perturb.norm() * 1.001f;
+	Vector3f normal(tensor_normals[3 * i + 0], tensor_normals[3 * i + 1], tensor_normals[3 * i + 2]);
+	// float sign = normal.dot(perturb) > 0 ? 1 : -1;
+	tensor_distances[i] = normal.dot(perturb) * 1.001f;// sign * perturb.norm() * 1.001f;
 }
 
 void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_steps, cudaStream_t stream) {
@@ -1329,6 +1331,7 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 		std::vector<float> distances_host;
 
 		core::Tensor positions({0, 3}, core::Dtype::Float32, device);
+		core::Tensor normals({0, 3}, core::Dtype::Float32, device);
 		core::Tensor distances({0}, core::Dtype::Float32, device);
 		for (int k = 0; k < sample_images; ++k) {
 			int i = rand_generator();
@@ -1337,10 +1340,20 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 				t::io::CreateImageFromFile(m_sdf.depth_fnames[i])->To(device).AsTensor();
 			auto pose = core::eigen_converter::EigenMatrixToTensor(m_sdf.lidar_poses[i]);
 
+			auto lidar_image = t::geometry::LiDARImage(depth_data);
 			core::Tensor xyz_im, mask_im;
 			std::tie(xyz_im, mask_im) =
-				t::geometry::LiDARImage(depth_data).Unproject(intrinsic, pose, 0.65, 30.0);
+				lidar_image.Unproject(intrinsic, pose, 0.65, 30.0);
+			auto normal_im = lidar_image.GetNormalMap(intrinsic, 0.65, 30.0);
+
 			auto xyz = xyz_im.IndexGet({mask_im});
+			auto nml = normal_im.IndexGet({mask_im});
+
+			auto tpcd = t::geometry::PointCloud(xyz);
+			tpcd.SetPointNormals(nml);
+			auto pcd = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(tpcd).ToLegacy());
+			// visualization::DrawGeometries({pcd});
+
 			xyz = (xyz - tcenter) / scale + toffset;
 			xyz = xyz.Contiguous();
 			auto distance = core::Tensor::Full({xyz.GetLength()}, 0, core::Dtype::Float32, device);
@@ -1362,24 +1375,25 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 						  num_perturb_samples,
 						  m_sdf.training.perturbations.data(),
 						  xyz_perturb.GetDataPtr<float>(),
+						  nml.GetDataPtr<float>(),
 						  distance_perturb.GetDataPtr<float>()
 						  );
 
 			// Stupid scale transform back-and-forth here for test:
-			auto xyz_perturb_rescale = (xyz_perturb - toffset) * scale + tcenter;
-			auto extrinsic = pose.Inverse();
-			core::Tensor u, v, r, mask;
-			std::tie(u, v, r, mask) = t::geometry::LiDARImage::Project(xyz_perturb_rescale, intrinsic, extrinsic);
+			// auto xyz_perturb_rescale = (xyz_perturb - toffset) * scale + tcenter;
+			// auto extrinsic = pose.Inverse();
+			// core::Tensor u, v, r, mask;
+			// std::tie(u, v, r, mask) = t::geometry::LiDARImage::Project(xyz_perturb_rescale, intrinsic, extrinsic);
 
-			u = u.IndexGet({mask});
-			v = v.IndexGet({mask});
-			r = r.IndexGet({mask});
-			auto d = depth_data.IndexGet({v, u}).View({-1});
-			auto sdf_perturb = (d.To(core::Float32) / 1000.0 - r) / (scale);
-			auto valid = d.Gt(0);
+			// u = u.IndexGet({mask});
+			// v = v.IndexGet({mask});
+			// r = r.IndexGet({mask});
+			// auto d = depth_data.IndexGet({v, u}).View({-1});
+			// auto sdf_perturb = (d.To(core::Float32) / 1000.0 - r) / (scale);
+			// auto valid = d.Gt(0);
 
-			xyz_perturb = xyz_perturb.IndexGet({mask}).IndexGet({valid});
-			distance_perturb = sdf_perturb.IndexGet({valid});
+			// xyz_perturb = xyz_perturb.IndexGet({mask}).IndexGet({valid});
+			// distance_perturb = sdf_perturb.IndexGet({valid});
 			// t::io::WriteNpz("distances.npz", {{"sdf", sdf_perturb.IndexGet({valid})}, {"distance", distance_perturb.IndexGet({mask}).IndexGet({valid})}});
 			// distance_perturb = distance_perturb.IndexGet({mask}).IndexGet({valid});
 
