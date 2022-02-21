@@ -38,6 +38,32 @@ using namespace tcnn;
 
 NGP_NAMESPACE_BEGIN
 
+
+static Eigen::Vector3d Jet(double v, double vmin, double vmax) {
+    Eigen::Vector3d c(1, 1, 1);
+    double dv;
+
+    if (v < vmin) v = vmin;
+    if (v > vmax) v = vmax;
+    dv = vmax - vmin;
+
+    if (v < (vmin + 0.25 * dv)) {
+        c(0) = 0;
+        c(1) = 4 * (v - vmin) / dv;
+    } else if (v < (vmin + 0.5 * dv)) {
+        c(0) = 0;
+        c(2) = 1 + 4 * (vmin + 0.25 * dv - v) / dv;
+    } else if (v < (vmin + 0.75 * dv)) {
+        c(0) = 4 * (v - vmin - 0.5 * dv) / dv;
+        c(2) = 0;
+    } else {
+        c(1) = 1 + 4 * (vmin + 0.75 * dv - v) / dv;
+        c(2) = 0;
+    }
+
+    return c;
+}
+
 template <typename T, int N>
 static std::vector<Eigen::Matrix<T, N, 1>> TensorToEigenVectorNxVector(
         const core::Tensor &tensor) {
@@ -1121,8 +1147,8 @@ void Testbed::load_mesh() {
 void Testbed::generate_training_samples_sdf(Vector3f* positions, float* distances, uint32_t n_to_generate, cudaStream_t stream, bool uniform_only) {
 	uint32_t n_to_generate_base = n_to_generate / 8;
 	const uint32_t n_to_generate_surface_exact = uniform_only ? 0 : n_to_generate_base*4;
-	const uint32_t n_to_generate_surface_offset = uniform_only ? 0 : n_to_generate_base*3;
-	const uint32_t n_to_generate_uniform = uniform_only ? n_to_generate : n_to_generate_base*1;
+	const uint32_t n_to_generate_surface_offset = uniform_only ? 0 : n_to_generate_base*4;
+	const uint32_t n_to_generate_uniform = uniform_only ? n_to_generate : n_to_generate_base*0;
 
 	const uint32_t n_to_generate_surface = n_to_generate_surface_exact + n_to_generate_surface_offset;
 
@@ -1189,7 +1215,7 @@ void Testbed::generate_training_samples_sdf(Vector3f* positions, float* distance
 	}
 
 	m_sdf.training.perturbations.enlarge(n_to_generate_surface_offset);
-	generate_random_logistic<float>(stream, m_rng, n_to_generate_surface_offset*3, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
+	generate_random_logistic<float>(stream, m_rng, n_to_generate_surface_offset*3, (float*)m_sdf.training.perturbations.data(), 0.0f, 0.01);
 
 	linear_kernel(perturb_sdf_samples, 0, stream,
 		n_to_generate_surface_offset,
@@ -1377,8 +1403,33 @@ void Testbed::training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, 
 		m_sdf.training.positions.copy_to_host(positions_host);
 		m_sdf.training.distances.copy_to_host(distances_host);
 
-		auto d = core::Tensor(distances_host, core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
-		utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
+		auto xyz = core::Tensor((float*)positions_host.data(), core::SizeVector{int64_t(m_sdf.training.size), 3}, core::Dtype::Float32, core::Device("CUDA:0"));
+		auto sdf = core::Tensor((float*)distances_host.data(), core::SizeVector{int64_t(m_sdf.training.size)}, core::Dtype::Float32, core::Device("CUDA:0"));
+
+		auto xyz_positive = xyz.IndexGet({sdf.Gt(0.0)});
+		auto xyz_negative = xyz.IndexGet({sdf.Le(0.0)});
+		auto xyz_isosurface = xyz.IndexGet({sdf.Eq(0.0)});
+
+		auto pcd_positive = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_positive).ToLegacy());
+		auto pcd_negative = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_negative).ToLegacy());
+		auto pcd_isosurface = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_isosurface).ToLegacy());
+
+		pcd_positive->PaintUniformColor(Eigen::Vector3d(1, 0, 0));
+		pcd_negative->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
+		pcd_isosurface->PaintUniformColor(Eigen::Vector3d(0, 1, 0));
+		visualization::DrawGeometries({pcd_positive, pcd_negative, pcd_isosurface});
+		// auto pcd = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy());
+		// pcd->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
+		// for (int i = 0; i < pcd->points_.size(); ++i) {
+		// 	if (distances_host[i] < 0) {
+		// 		pcd->colors_[i] = Eigen::Vector3d(0, 0, 1);
+		// 	} else {
+		// 		pcd->colors_[i] = Jet((distances_host[i]), 0, 0.01);
+		// 	}
+		// }
+		// visualization::DrawGeometries({pcd});
+
+		// utility::LogInfo("d length = {}, d min = {}, d max = {}", d.GetLength(), d.Min({0}).Item<float>(), d.Max({0}).Item<float>());
 	}
 }
 
