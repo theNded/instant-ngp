@@ -1345,9 +1345,12 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 			xyz = xyz.Contiguous();
 			auto distance = core::Tensor::Full({xyz.GetLength()}, 0, core::Dtype::Float32, device);
 
+			positions = positions.Append(xyz, 0);
+			distances = distances.Append(distance, 0);
+
 			// Perturb directly on Tensor
 			// TODO: perturb on the range image according to ray-dot product
-			float stddev = 0.01;
+			float stddev = 0.05;
 
 			auto xyz_perturb = xyz.Clone();
 			auto distance_perturb = distance.Clone();
@@ -1362,22 +1365,46 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 						  distance_perturb.GetDataPtr<float>()
 						  );
 
-			positions = positions.Append(xyz, 0).Append(xyz_perturb, 0);
-			distances = distances.Append(distance, 0).Append(distance_perturb, 0);
+			// Stupid scale transform back-and-forth here for test:
+			auto xyz_perturb_rescale = (xyz_perturb - toffset) * scale + tcenter;
+			auto extrinsic = pose.Inverse();
+			core::Tensor u, v, r, mask;
+			std::tie(u, v, r, mask) = t::geometry::LiDARImage::Project(xyz_perturb_rescale, intrinsic, extrinsic);
+
+			u = u.IndexGet({mask});
+			v = v.IndexGet({mask});
+			r = r.IndexGet({mask});
+			auto d = depth_data.IndexGet({v, u}).View({-1});
+			auto sdf_perturb = (d.To(core::Float32) / 1000.0 - r) / (scale);
+			auto valid = d.Gt(0);
+
+			xyz_perturb = xyz_perturb.IndexGet({mask}).IndexGet({valid});
+			distance_perturb = sdf_perturb.IndexGet({valid});
+			// t::io::WriteNpz("distances.npz", {{"sdf", sdf_perturb.IndexGet({valid})}, {"distance", distance_perturb.IndexGet({mask}).IndexGet({valid})}});
+			// distance_perturb = distance_perturb.IndexGet({mask}).IndexGet({valid});
+
+			// auto negative_distance = distance_perturb.Le(0);
+			// distance_perturb.IndexSet({negative_distance}, -1 * distance_perturb.IndexGet({negative_distance}));
+			// utility::LogInfo("valid perturbed points {}/{}", xyz_perturb.GetLength(), xyz_perturb_rescale.GetLength());
+
+			positions = positions.Append(xyz_perturb, 0);
+			distances = distances.Append(distance_perturb, 0);
 		}
 
+		utility::LogInfo("d min: {}, max: {}", distances.Min({0}).Item<float>(), distances.Max({0}).Item<float>());
 		// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(positions).ToLegacy())});
 		auto xyz_positive = positions.IndexGet({distances.Gt(0.0)});
+		auto xyz_negative = positions.IndexGet({distances.Lt(0.0)});
 		auto xyz_isosurface = positions.IndexGet({distances.Eq(0.0)});
 
 		auto pcd_positive = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_positive).ToLegacy());
-		// auto pcd_negative = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_negative).ToLegacy());
+		auto pcd_negative = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_negative).ToLegacy());
 		auto pcd_isosurface = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_isosurface).ToLegacy());
 
 		pcd_positive->PaintUniformColor(Eigen::Vector3d(1, 0, 0));
-		// pcd_negative->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
+		pcd_negative->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
 		pcd_isosurface->PaintUniformColor(Eigen::Vector3d(0, 1, 0));
-		// visualization::DrawGeometries({pcd_positive, pcd_isosurface});
+		// visualization::DrawGeometries({pcd_positive, pcd_isosurface, pcd_negative});
 
 		m_sdf.training.size = positions.GetLength();
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
@@ -1427,7 +1454,7 @@ void Testbed::training_prep_sdf(uint32_t batch_size, uint32_t n_training_steps, 
 		pcd_positive->PaintUniformColor(Eigen::Vector3d(1, 0, 0));
 		pcd_negative->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
 		pcd_isosurface->PaintUniformColor(Eigen::Vector3d(0, 1, 0));
-		visualization::DrawGeometries({pcd_positive, pcd_negative, pcd_isosurface});
+		// visualization::DrawGeometries({pcd_positive, pcd_negative, pcd_isosurface});
 		// auto pcd = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz).ToLegacy());
 		// pcd->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
 		// for (int i = 0; i < pcd->points_.size(); ++i) {
