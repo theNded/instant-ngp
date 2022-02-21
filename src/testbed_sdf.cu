@@ -1051,7 +1051,6 @@ void Testbed::load_posed_lidar_images() {
 	m_raw_aabb = get_lidar_scene_aabb();
 	utility::LogInfo("raw AABB= {}", m_raw_aabb);
 
-
 	// Inflate AABB by 1% to give the network a little wiggle room.
 	m_raw_aabb.inflate(m_raw_aabb.diag().norm() * 0.005f);
 	m_sdf.mesh_scale = m_raw_aabb.diag().maxCoeff();
@@ -1344,30 +1343,41 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 			auto xyz = xyz_im.IndexGet({mask_im});
 			xyz = (xyz - tcenter) / scale + toffset;
 			xyz = xyz.Contiguous();
-
 			auto distance = core::Tensor::Full({xyz.GetLength()}, 0, core::Dtype::Float32, device);
 
 			// Perturb directly on Tensor
 			// TODO: perturb on the range image according to ray-dot product
-			float stddev = 0.1;
-			m_sdf.training.perturbations.enlarge(xyz.GetLength());
+			float stddev = 0.01;
 
-			// Keep 2/3 unchanged and perturb 1/3
-			int num_perturb_samples = xyz.GetLength() / 3;
+			auto xyz_perturb = xyz.Clone();
+			auto distance_perturb = distance.Clone();
+			m_sdf.training.perturbations.enlarge(xyz_perturb.GetLength());
+			int num_perturb_samples = xyz_perturb.GetLength();
 
 			generate_random_logistic<float>(stream, m_rng, num_perturb_samples*3, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
 			linear_kernel(perturb_samples, 0, stream,
 						  num_perturb_samples,
 						  m_sdf.training.perturbations.data(),
-						  xyz.GetDataPtr<float>(),
-						  distance.GetDataPtr<float>()
+						  xyz_perturb.GetDataPtr<float>(),
+						  distance_perturb.GetDataPtr<float>()
 						  );
 
-			positions = positions.Append(xyz, 0);
-			distances = distances.Append(distance, 0);
+			positions = positions.Append(xyz, 0).Append(xyz_perturb, 0);
+			distances = distances.Append(distance, 0).Append(distance_perturb, 0);
 		}
 
 		// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(positions).ToLegacy())});
+		auto xyz_positive = positions.IndexGet({distances.Gt(0.0)});
+		auto xyz_isosurface = positions.IndexGet({distances.Eq(0.0)});
+
+		auto pcd_positive = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_positive).ToLegacy());
+		// auto pcd_negative = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_negative).ToLegacy());
+		auto pcd_isosurface = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_isosurface).ToLegacy());
+
+		pcd_positive->PaintUniformColor(Eigen::Vector3d(1, 0, 0));
+		// pcd_negative->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
+		pcd_isosurface->PaintUniformColor(Eigen::Vector3d(0, 1, 0));
+		// visualization::DrawGeometries({pcd_positive, pcd_isosurface});
 
 		m_sdf.training.size = positions.GetLength();
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
