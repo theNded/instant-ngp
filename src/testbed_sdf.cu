@@ -1030,36 +1030,27 @@ BoundingBox Testbed::get_lidar_scene_aabb(const Vector3f &center, float scale) {
 }
 
 void Testbed::load_posed_lidar_images() {
+	auto device = core::Device("CUDA:0");
+	auto data = t::io::ReadNpz(m_data_path.str());
 
-	// TODO: make it configurable somewhere
-	m_sdf.lidar_intrinsic_fname = "data/sdf/ouster_calib.npz";
+	core::Tensor voxel_coords = data.at("voxel_coords").To(device);
+	auto pcd = t::geometry::PointCloud(voxel_coords).ToLegacy();
 
-	auto pose_graph = io::CreatePoseGraphFromFile((m_data_path / "pose_graph.json").str());
-	auto depth_path = (m_data_path / "depth").str();
-
-	utility::filesystem::ListFilesInDirectory(depth_path, m_sdf.depth_fnames);
-	std::sort(m_sdf.depth_fnames.begin(), m_sdf.depth_fnames.end());
-
-	int n_poses = pose_graph->nodes_.size();
-
-	m_sdf.lidar_poses.resize(n_poses);
-	for (int i = 0; i < n_poses; ++i) {
-		m_sdf.lidar_poses[i] = pose_graph->nodes_[i].pose_;
-	}
-
-	utility::LogInfo("Estimating raw aabb from {} frames ...", n_poses);
-	m_raw_aabb = get_lidar_scene_aabb();
-	utility::LogInfo("raw AABB= {}", m_raw_aabb);
-
-	// Inflate AABB by 1% to give the network a little wiggle room.
+	m_raw_aabb.min = pcd.GetMinBound().cast<float>();
+	m_raw_aabb.max = pcd.GetMaxBound().cast<float>();
 	m_raw_aabb.inflate(m_raw_aabb.diag().norm() * 0.005f);
 	m_sdf.mesh_scale = m_raw_aabb.diag().maxCoeff();
+	utility::LogInfo("Raw AABB={}", m_raw_aabb);
 
-	auto aabb_center = 0.5 * (m_raw_aabb.min + m_raw_aabb.max);
-	utility::LogInfo("Estimating normalized aabb from {} frames ...", n_poses);
-	m_aabb = get_lidar_scene_aabb(aabb_center, m_sdf.mesh_scale);
-	utility::LogInfo("normalized AABB={}", m_aabb);
+	auto center = 0.5 * (m_raw_aabb.min + m_raw_aabb.max);
+	auto tcenter = core::Tensor(std::vector<float>{center(0), center(1), center(2)}, {1, 3}, core::Dtype::Float32, device);
+	auto offset = core::Tensor::Full({1, 3}, 0.5f, core::Dtype::Float32, device);
+	m_sdf.m_pcd_rescaled = (voxel_coords - tcenter) / m_sdf.mesh_scale + offset;
+	m_sdf.m_tsdf = data.at("tsdf").To(device);
 
+	auto pcd_rescaled = t::geometry::PointCloud(m_sdf.m_pcd_rescaled).ToLegacy();
+	m_aabb.min = pcd_rescaled.GetMinBound().cast<float>();
+	m_aabb.max = pcd_rescaled.GetMaxBound().cast<float>();
 	m_aabb = m_aabb.intersection(BoundingBox{Vector3f::Zero(), Vector3f::Ones()});
 	utility::LogInfo("AABB intersects with (0, 1)={}", m_aabb);
 
@@ -1068,7 +1059,6 @@ void Testbed::load_posed_lidar_images() {
 
 	m_sdf.training.idx = 0;
 	m_sdf.training.size = 0;
-
 }
 
 void Testbed::load_mesh() {
@@ -1313,116 +1303,15 @@ void Testbed::training_prep_lidar_sdf(uint32_t batch_size, uint32_t n_training_s
 	if (m_sdf.training.generate_sdf_data_online) {
 		m_sdf.training.size = batch_size*n_training_steps;
 
-		core::Device device("CUDA:0");
-		t::geometry::LiDARIntrinsic intrinsic(m_sdf.lidar_intrinsic_fname, device);
-
-		int sample_images = 16;
-		int n_images = m_sdf.depth_fnames.size();
-		utility::UniformRandIntGenerator rand_generator(0, n_images - 1, 15213);
-
-		auto center = 0.5 * (m_raw_aabb.min + m_raw_aabb.max);
-		auto tcenter = core::Tensor(std::vector<float>{center(0), center(1), center(2)}, {1, 3}, core::Dtype::Float32, device);
-		auto toffset = core::Tensor::Full({1, 3}, 0.5f, core::Dtype::Float32, device);
-
-		float scale = m_sdf.mesh_scale;
-
-		// int position_samples = 0;
-		std::vector<Vector3f> positions_host;
-		std::vector<float> distances_host;
-
-		core::Tensor positions({0, 3}, core::Dtype::Float32, device);
-		core::Tensor normals({0, 3}, core::Dtype::Float32, device);
-		core::Tensor distances({0}, core::Dtype::Float32, device);
-		for (int k = 0; k < sample_images; ++k) {
-			int i = rand_generator();
-
-			core::Tensor depth_data =
-				t::io::CreateImageFromFile(m_sdf.depth_fnames[i])->To(device).AsTensor();
-			auto pose = core::eigen_converter::EigenMatrixToTensor(m_sdf.lidar_poses[i]);
-
-			auto lidar_image = t::geometry::LiDARImage(depth_data);
-			core::Tensor xyz_im, mask_im;
-			std::tie(xyz_im, mask_im) =
-				lidar_image.Unproject(intrinsic, pose, 0.65, 30.0);
-			auto normal_im = lidar_image.GetNormalMap(intrinsic, 0.65, 30.0);
-
-			auto xyz = xyz_im.IndexGet({mask_im});
-			auto nml = normal_im.IndexGet({mask_im});
-
-			auto tpcd = t::geometry::PointCloud(xyz);
-			tpcd.SetPointNormals(nml);
-			auto pcd = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(tpcd).ToLegacy());
-			// visualization::DrawGeometries({pcd});
-
-			xyz = (xyz - tcenter) / scale + toffset;
-			xyz = xyz.Contiguous();
-			auto distance = core::Tensor::Full({xyz.GetLength()}, 0, core::Dtype::Float32, device);
-
-			positions = positions.Append(xyz, 0);
-			distances = distances.Append(distance, 0);
-
-			// Perturb directly on Tensor
-			// TODO: perturb on the range image according to ray-dot product
-			float stddev = 0.05;
-
-			auto xyz_perturb = xyz.Clone();
-			auto distance_perturb = distance.Clone();
-			m_sdf.training.perturbations.enlarge(xyz_perturb.GetLength());
-			int num_perturb_samples = xyz_perturb.GetLength();
-
-			generate_random_logistic<float>(stream, m_rng, num_perturb_samples*3, (float*)m_sdf.training.perturbations.data(), 0.0f, stddev);
-			linear_kernel(perturb_samples, 0, stream,
-						  num_perturb_samples,
-						  m_sdf.training.perturbations.data(),
-						  xyz_perturb.GetDataPtr<float>(),
-						  nml.GetDataPtr<float>(),
-						  distance_perturb.GetDataPtr<float>()
-						  );
-
-			// Stupid scale transform back-and-forth here for test:
-			// auto xyz_perturb_rescale = (xyz_perturb - toffset) * scale + tcenter;
-			// auto extrinsic = pose.Inverse();
-			// core::Tensor u, v, r, mask;
-			// std::tie(u, v, r, mask) = t::geometry::LiDARImage::Project(xyz_perturb_rescale, intrinsic, extrinsic);
-
-			// u = u.IndexGet({mask});
-			// v = v.IndexGet({mask});
-			// r = r.IndexGet({mask});
-			// auto d = depth_data.IndexGet({v, u}).View({-1});
-			// auto sdf_perturb = (d.To(core::Float32) / 1000.0 - r) / (scale);
-			// auto valid = d.Gt(0);
-
-			// xyz_perturb = xyz_perturb.IndexGet({mask}).IndexGet({valid});
-			// distance_perturb = sdf_perturb.IndexGet({valid});
-			// t::io::WriteNpz("distances.npz", {{"sdf", sdf_perturb.IndexGet({valid})}, {"distance", distance_perturb.IndexGet({mask}).IndexGet({valid})}});
-			// distance_perturb = distance_perturb.IndexGet({mask}).IndexGet({valid});
-
-			// auto negative_distance = distance_perturb.Le(0);
-			// distance_perturb.IndexSet({negative_distance}, -1 * distance_perturb.IndexGet({negative_distance}));
-			// utility::LogInfo("valid perturbed points {}/{}", xyz_perturb.GetLength(), xyz_perturb_rescale.GetLength());
-
-			positions = positions.Append(xyz_perturb, 0);
-			distances = distances.Append(distance_perturb, 0);
-		}
-
-		utility::LogInfo("d min: {}, max: {}", distances.Min({0}).Item<float>(), distances.Max({0}).Item<float>());
-		// visualization::DrawGeometries({std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(positions).ToLegacy())});
-		auto xyz_positive = positions.IndexGet({distances.Gt(0.0)});
-		auto xyz_negative = positions.IndexGet({distances.Lt(0.0)});
-		auto xyz_isosurface = positions.IndexGet({distances.Eq(0.0)});
-
-		auto pcd_positive = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_positive).ToLegacy());
-		auto pcd_negative = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_negative).ToLegacy());
-		auto pcd_isosurface = std::make_shared<geometry::PointCloud>(t::geometry::PointCloud(xyz_isosurface).ToLegacy());
-
-		pcd_positive->PaintUniformColor(Eigen::Vector3d(1, 0, 0));
-		pcd_negative->PaintUniformColor(Eigen::Vector3d(0, 0, 1));
-		pcd_isosurface->PaintUniformColor(Eigen::Vector3d(0, 1, 0));
-		// visualization::DrawGeometries({pcd_positive, pcd_isosurface, pcd_negative});
-
-		m_sdf.training.size = positions.GetLength();
 		m_sdf.training.positions.enlarge(m_sdf.training.size);
 		m_sdf.training.distances.enlarge(m_sdf.training.size);
+
+		auto device = core::Device("CUDA:0");
+		core::Tensor random_indices({(int64_t)m_sdf.training.size}, core::Dtype::Int64, device);
+		generate_random_uniform<int64_t>(stream, m_rng, m_sdf.training.size, random_indices.GetDataPtr<int64_t>(), 0, m_sdf.m_pcd_rescaled.GetLength());
+
+		auto positions = m_sdf.m_pcd_rescaled.IndexGet({random_indices});
+		auto distances = m_sdf.m_tsdf.IndexGet({random_indices}).Abs();
 
 		linear_kernel(copy_samples, 0, stream,
 					  m_sdf.training.size,

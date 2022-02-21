@@ -36,6 +36,8 @@
 #include <pybind11/numpy.h>
 #endif
 
+#include "open3d/Open3D.h"
+
 struct GLFWwindow;
 
 TCNN_NAMESPACE_BEGIN
@@ -577,6 +579,9 @@ public:
 		tcnn::GPUMemory<uint32_t> iou_counter;
 
 		// Additional LiDAR info
+		open3d::core::Tensor m_pcd_rescaled;
+		open3d::core::Tensor m_tsdf;
+
 		std::string lidar_intrinsic_fname;
 		std::vector<std::string> depth_fnames;
 		std::vector<Eigen::Matrix4d> lidar_poses;
